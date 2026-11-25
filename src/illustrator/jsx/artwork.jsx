@@ -1,0 +1,119 @@
+// Ordered vector scene renderer for complex reference artwork. ES3 / Illustrator 2020+.
+function renderArtwork(scene) {
+    var doc = app.activeDocument, prior = app.coordinateSystem, current = "start";
+    var layers = {}, groups = {}, textCount = 0, warnings = [];
+    function color(hex) {
+        var c = new RGBColor();
+        c.red = parseInt(hex.substr(1,2),16); c.green = parseInt(hex.substr(3,2),16); c.blue = parseInt(hex.substr(5,2),16);
+        return c;
+    }
+    function gradientFill(spec, id, item) {
+        var gradient = doc.gradients.add();
+        gradient.name = 'SCI_GRADIENT_' + id;
+        gradient.type = GradientType.LINEAR;
+        while (gradient.gradientStops.length < spec.stops.length) gradient.gradientStops.add();
+        for (var i = 0; i < spec.stops.length; i++) {
+            var input = spec.stops[i], stop = gradient.gradientStops[i];
+            stop.rampPoint = input.offset;
+            stop.color = color(input.color);
+            stop.opacity = input.opacity === undefined ? 100 : input.opacity;
+            stop.midPoint = 50;
+        }
+        var dx = spec.end[0] - spec.start[0], dy = spec.start[1] - spec.end[1];
+        var paint = new GradientColor();
+        paint.gradient = gradient;
+        item.fillColor = paint;
+        // Illustrator 2022 ignores GradientColor.angle/matrix assignments.
+        // Rotate the native gradient only, retaining the path geometry.
+        var angle = Math.atan2(dy, dx) * 180 / Math.PI;
+        if (angle) item.rotate(angle, false, false, true, false, Transformation.CENTER);
+    }
+    try {
+        app.coordinateSystem = CoordinateSystem.DOCUMENTCOORDINATESYSTEM;
+        var b = doc.artboards[0].artboardRect;
+        function xy(p) { return [b[0] + p[0], b[1] - p[1]]; }
+        for (var i = 0; i < scene.items.length; i++) {
+            var o = scene.items[i]; current = o.id;
+            if (!layers[o.layer]) {
+                try { layers[o.layer] = doc.layers.getByName(o.layer); }
+                catch (missingLayer) { layers[o.layer] = doc.layers.add(); layers[o.layer].name = o.layer; }
+            }
+            var parent = layers[o.layer];
+            if (o.group) {
+                var key = o.layer + "/" + o.group;
+                if (!groups[key]) {
+                    try { groups[key] = parent.groupItems.getByName("SCI_GROUP_" + o.group); }
+                    catch (missingGroup) { groups[key] = parent.groupItems.add(); groups[key].name = "SCI_GROUP_" + o.group; }
+                }
+                parent = groups[key];
+            }
+            if (scene.session_key) {
+                parent = $.global[scene.session_key].slots[o.swarm_index];
+                if (parent.pageItems.length) throw new Error('Primitive already drawn: ' + o.id);
+            }
+            var item;
+            if (o.kind === "text") {
+                item = parent.textFrames.add(); item.name = "SCI_TEXT_" + o.id;
+                item.contents = o.text.replace(/\n/g,"\r");
+                item.textRange.characterAttributes.size = o.size;
+                item.textRange.characterAttributes.fillColor = color(o.fill);
+                try { item.textRange.characterAttributes.textFont = app.textFonts.getByName(o.font); }
+                catch (fontError) { warnings.push("Font fallback: " + o.font); }
+                if (o.runs) {
+                    for (var r = 0; r < o.runs.length; r++) {
+                        var run = o.runs[r];
+                        for (var c = run.start; c < run.start + run.length; c++) {
+                            if (run.color) item.characters[c].characterAttributes.fillColor = color(run.color);
+                            if (run.size) item.characters[c].characterAttributes.size = run.size;
+                            if (run.shift) item.characters[c].characterAttributes.baselineShift = run.shift;
+                        }
+                    }
+                }
+                if (o.rotation) item.rotate(o.rotation);
+                if (!scene.defer_redraw) app.redraw();
+                if (item.width > o.width + 1 || item.height > o.height + 1)
+                    warnings.push("Text box exceeded: " + o.id + " " + item.width.toFixed(1) + "x" + item.height.toFixed(1));
+                item.left = b[0] + o.x + (o.align === "left" ? 0 : (o.width - item.width) / 2);
+                item.top = b[1] - o.y - (o.height - item.height) / 2;
+                if (item.contents !== o.text.replace(/\n/g,"\r")) throw new Error("Text changed: " + o.id);
+                textCount++;
+            } else {
+                if (o.kind === "ellipse") item = parent.pathItems.ellipse(b[1]-o.y,b[0]+o.x,o.width,o.height);
+                else if (o.kind === "rect") {
+                    if (o.radius) item = parent.pathItems.roundedRectangle(b[1]-o.y,b[0]+o.x,o.width,o.height,o.radius,o.radius);
+                    else item = parent.pathItems.rectangle(b[1]-o.y,b[0]+o.x,o.width,o.height);
+                } else {
+                    if (o.kind === 'arrow') {
+                        item = $.global[scene.session_key].arrowTemplates[nativeArrowKey(o)].duplicate(parent, ElementPlacement.PLACEATBEGINNING);
+                        item.hidden = false;
+                    } else item = parent.pathItems.add();
+                    var points = [];
+                    for (var p = 0; p < o.points.length; p++) points.push(xy(o.points[p]));
+                    item.setEntirePath(points); item.closed = !!o.closed;
+                }
+                item.name = "SCI_PATH_" + o.id;
+                item.filled = !!o.fill; if (o.fill) item.fillColor = color(o.fill);
+                if (o.gradient) { item.filled = true; gradientFill(o.gradient, o.id, item); }
+                item.stroked = !!o.stroke; if (o.stroke) { item.strokeColor = color(o.stroke); item.strokeWidth = o.stroke_width; }
+                if (o.dash) item.strokeDashes = o.dash;
+            }
+            if (o.opacity !== undefined) item.opacity = o.opacity;
+            if (scene.element_delay_ms) { app.redraw(); $.sleep(scene.element_delay_ms); }
+        }
+        var expectedText = scene.expected_text_total === undefined ? textCount : scene.expected_text_total;
+        var leafCount = 0, rasterCount = 0;
+        var expectedTotal = scene.expected_total === undefined ? scene.items.length : scene.expected_total;
+        if (scene.defer_validation) leafCount = expectedTotal;
+        else {
+            if (doc.textFrames.length !== expectedText) throw new Error("Unexpected split text frames");
+            for (var k = 0; k < doc.pageItems.length; k++) {
+                if (doc.pageItems[k].typename !== "GroupItem") leafCount++;
+                if (doc.pageItems[k].typename === "RasterItem" || doc.pageItems[k].typename === "PlacedItem") rasterCount++;
+            }
+        }
+        if (leafCount !== expectedTotal || rasterCount !== 0) throw new Error("Object count or raster validation failed");
+        app.redraw();
+        return "OK|" + leafCount + "|" + expectedText + "|" + warnings.join("; ");
+    } catch (e) { return "ERROR|" + current + "|line " + e.line + ": " + e.message; }
+    finally { app.coordinateSystem = prior; }
+}
